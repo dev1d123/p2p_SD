@@ -1,5 +1,7 @@
 .clover/
 target/
+dependency-reduced-pom.xml
+received/
 .project
 .classpath
 .settings/
