@@ -1,6 +1,10 @@
 package com.basrikahveci.p2p.peer;
 
+import com.basrikahveci.p2p.monitor.PeerRuntimeSnapshot;
+import com.basrikahveci.p2p.monitor.PeerTelemetryPublisher;
+import com.basrikahveci.p2p.monitor.PeerMonitorEventPublisher;
 import com.basrikahveci.p2p.peer.network.Connection;
+import com.basrikahveci.p2p.peer.network.message.file.FileTransfer;
 import com.basrikahveci.p2p.peer.network.message.ping.CancelPongs;
 import com.basrikahveci.p2p.peer.network.message.ping.Ping;
 import com.basrikahveci.p2p.peer.network.message.ping.Pong;
@@ -12,6 +16,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
@@ -34,6 +41,12 @@ public class Peer {
     private Channel bindChannel;
 
     private boolean running = true;
+
+    private final PeerTelemetryPublisher telemetryPublisher = new PeerTelemetryPublisher();
+
+    private final PeerMonitorEventPublisher eventPublisher = new PeerMonitorEventPublisher();
+
+    private final Path incomingFilesRoot = Paths.get("received");
 
     public Peer(Config config, ConnectionService connectionService, PingService pingService, LeadershipService leadershipService) {
         this.config = config;
@@ -260,6 +273,8 @@ public class Peer {
         }
         bindChannel.close();
         running = false;
+        telemetryPublisher.close();
+        eventPublisher.close();
     }
 
     public void connectTo(final String host, final int port, final CompletableFuture<Void> futureToNotify) {
@@ -272,6 +287,75 @@ public class Peer {
 
     private boolean isShutdown() {
         return !running;
+    }
+
+    public void publishTelemetry() {
+        if (isShutdown()) {
+            return;
+        }
+
+        final int bindPort = bindChannel == null ? -1 : ((InetSocketAddress) bindChannel.localAddress()).getPort();
+        final String leaderName = leadershipService.getLeaderName();
+        final boolean isLeader = config.getPeerName().equals(leaderName);
+
+        final PeerRuntimeSnapshot snapshot = new PeerRuntimeSnapshot(
+                config.getPeerName(),
+                bindPort,
+                connectionService.getConnectedPeerNames(),
+                leaderName,
+                isLeader,
+                leadershipService.isElectionInProgress(),
+                pingService.getCurrentPingCount(),
+                System.currentTimeMillis()
+        );
+        telemetryPublisher.publish(snapshot);
+    }
+
+    public void sendFile(final String targetPeerName, final String fileName, final byte[] content,
+                         final CompletableFuture<Void> futureToNotify) {
+        if (isShutdown()) {
+            futureToNotify.completeExceptionally(new RuntimeException("Disconnected!"));
+            return;
+        }
+
+        final Connection connection = connectionService.getConnection(targetPeerName);
+        if (connection == null) {
+            futureToNotify.completeExceptionally(
+                    new IllegalStateException("No direct connection to peer " + targetPeerName));
+            return;
+        }
+
+        connection.send(new FileTransfer(config.getPeerName(), fileName, content));
+        LOGGER.info("File {} ({} bytes) sent to {}", fileName, content.length, targetPeerName);
+        eventPublisher.publish(config.getPeerName(), "INFO",
+            "File sent to " + targetPeerName + ": " + fileName + " (" + content.length + " bytes)");
+        futureToNotify.complete(null);
+    }
+
+    public void handleIncomingFile(final String senderPeerName, final String fileName, final byte[] content) {
+        if (isShutdown()) {
+            LOGGER.warn("Incoming file {} from {} ignored since peer is shutting down", fileName, senderPeerName);
+            return;
+        }
+
+        try {
+            final Path peerDir = incomingFilesRoot.resolve(config.getPeerName());
+            Files.createDirectories(peerDir);
+            final String sanitizedName = sanitizeFileName(fileName);
+            final Path outputPath = peerDir.resolve(System.currentTimeMillis() + "_from_" + senderPeerName + "_" + sanitizedName);
+            Files.write(outputPath, content);
+            LOGGER.info("Received file {} ({} bytes) from {}. Stored at {}", fileName, content.length, senderPeerName, outputPath);
+                eventPublisher.publish(config.getPeerName(), "INFO",
+                    "File received from " + senderPeerName + ": " + fileName + " -> " + outputPath.toString());
+        } catch (Exception e) {
+            LOGGER.error("Failed to persist incoming file {} from {}", fileName, senderPeerName, e);
+                eventPublisher.publish(config.getPeerName(), "ERROR",
+                    "Failed to save file from " + senderPeerName + ": " + fileName + " (" + e.getMessage() + ")");
+        }
+    }
+
+    private String sanitizeFileName(String fileName) {
+        return fileName.replaceAll("[^a-zA-Z0-9._-]", "_");
     }
 
 }

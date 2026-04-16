@@ -1,5 +1,7 @@
 package com.basrikahveci.p2p.peer;
 
+import com.basrikahveci.p2p.monitor.PeerControlProtocol;
+import com.basrikahveci.p2p.monitor.PeerMonitorEventPublisher;
 import com.basrikahveci.p2p.peer.network.PeerChannelHandler;
 import com.basrikahveci.p2p.peer.network.PeerChannelInitializer;
 import com.basrikahveci.p2p.peer.service.ConnectionService;
@@ -20,9 +22,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Executors;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.SocketException;
+import java.io.IOException;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -48,6 +59,14 @@ public class PeerHandle {
     private Future keepAliveFuture;
 
     private Future timeoutPingsFuture;
+
+    private Future telemetryPublishFuture;
+
+    private DatagramSocket controlSocket;
+
+    private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
+
+    private final PeerMonitorEventPublisher eventPublisher = new PeerMonitorEventPublisher();
 
     public PeerHandle(Config config, int portToBind) {
         this.config = config;
@@ -103,6 +122,11 @@ public class PeerHandle {
 
             this.timeoutPingsFuture = peerEventLoopGroup.scheduleAtFixedRate((Runnable) peer::timeoutPings, 0, 100, TimeUnit.MILLISECONDS);
 
+            this.telemetryPublishFuture = peerEventLoopGroup.scheduleAtFixedRate((Runnable) peer::publishTelemetry, 0, 1, SECONDS);
+
+            startControlListener();
+            eventPublisher.publish(config.getPeerName(), "INFO", "Peer started. Control port: " + PeerControlProtocol.controlPortForPeer(portToBind));
+
             closeFuture = serverChannel.closeFuture();
         } else {
             LOGGER.error(config.getPeerName() + " could not bind to " + portToBind, bindFuture.cause());
@@ -121,12 +145,10 @@ public class PeerHandle {
     public CompletableFuture<Void> leave() {
         final CompletableFuture<Void> future = new CompletableFuture<>();
         peerEventLoopGroup.execute(() -> peer.leave(future));
-        if (keepAliveFuture != null && timeoutPingsFuture != null) {
-            keepAliveFuture.cancel(false);
-            timeoutPingsFuture.cancel(false);
-            keepAliveFuture = null;
-            timeoutPingsFuture = null;
-        }
+        cancelScheduledTasks();
+        stopControlListener();
+        eventPublisher.publish(config.getPeerName(), "INFO", "Peer stopped");
+        eventPublisher.close();
         return future;
     }
 
@@ -144,6 +166,78 @@ public class PeerHandle {
 
     public void disconnect(final String peerName) {
         peerEventLoopGroup.execute(() -> peer.disconnect(peerName));
+    }
+
+    public CompletableFuture<Void> sendFile(final String peerName, final String pathToFile) {
+        final CompletableFuture<Void> future = new CompletableFuture<>();
+
+        try {
+            final Path filePath = Paths.get(pathToFile);
+            final byte[] content = Files.readAllBytes(filePath);
+            final String fileName = filePath.getFileName().toString();
+            peerEventLoopGroup.execute(() -> peer.sendFile(peerName, fileName, content, future));
+        } catch (Exception e) {
+            future.completeExceptionally(e);
+        }
+
+        return future;
+    }
+
+    private void startControlListener() {
+        controlExecutor.execute(() -> {
+            final int controlPort = PeerControlProtocol.controlPortForPeer(portToBind);
+            try {
+                controlSocket = new DatagramSocket(controlPort);
+                final byte[] buffer = new byte[4096];
+                while (!Thread.currentThread().isInterrupted() && !controlSocket.isClosed()) {
+                    final DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    controlSocket.receive(packet);
+                    final PeerControlProtocol.ControlCommand command = PeerControlProtocol.decode(packet.getData(), packet.getLength());
+                    if (command == null) {
+                        continue;
+                    }
+
+                    if (PeerControlProtocol.ACTION_SEND_FILE.equals(command.getAction())) {
+                        sendFile(command.getDestinationPeerName(), command.getFilePath())
+                                .whenComplete((result, error) -> {
+                                    if (error == null) {
+                                        eventPublisher.publish(config.getPeerName(), "INFO",
+                                                "sendfile to " + command.getDestinationPeerName() + " succeeded: " + command.getFilePath());
+                                    } else {
+                                        eventPublisher.publish(config.getPeerName(), "ERROR",
+                                                "sendfile to " + command.getDestinationPeerName() + " failed: " + error.getMessage());
+                                    }
+                                });
+                    }
+                }
+            } catch (SocketException ignored) {
+                // Closed when peer is shutting down.
+            } catch (IOException e) {
+                LOGGER.warn("Control listener failed for {}", config.getPeerName(), e);
+            }
+        });
+    }
+
+    private void stopControlListener() {
+        if (controlSocket != null) {
+            controlSocket.close();
+        }
+        controlExecutor.shutdownNow();
+    }
+
+    private void cancelScheduledTasks() {
+        if (keepAliveFuture != null) {
+            keepAliveFuture.cancel(false);
+            keepAliveFuture = null;
+        }
+        if (timeoutPingsFuture != null) {
+            timeoutPingsFuture.cancel(false);
+            timeoutPingsFuture = null;
+        }
+        if (telemetryPublishFuture != null) {
+            telemetryPublishFuture.cancel(false);
+            telemetryPublishFuture = null;
+        }
     }
 
 }

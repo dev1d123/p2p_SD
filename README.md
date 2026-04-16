@@ -46,11 +46,32 @@ Run
   
 You can start a peer by starting a java process with the produced jar file as follows:
   
-`java -jar -DpeerName=Peer1 p2p.jar -n Peer1 -b 50670` 
+`java -DpeerName=Peer1 -jar p2p.jar -n Peer1 -b 50670` 
 
 This command starts a peer with name `Peer1` and binds it to port `50670`. It is the user's responsibility to guarantee uniqueness among names of the peers. 
 
 `-DpeerName=...` is not necessary if you change default logging configuration of the project.
+
+You can also launch a graphical monitor that displays active peers in real time:
+
+`java -jar p2p.jar --monitor`
+
+The monitor has two tabs:
+- `Peers`: tabular runtime metrics
+- `Graph`: live topology graph of neighbour links
+
+It also includes:
+- A file-transfer control panel (source peer, destination peer, file path, send button)
+- A `Terminal` tab for useful real-time events
+
+You can send a file to a directly connected peer from the interactive prompt:
+
+`sendfile peerName /path/to/file`
+
+Equivalent flow from GUI:
+1. Open monitor with `--monitor`
+2. Select source and destination peers
+3. Choose a file path and click `Send File`
  
  After starting the peer, you can type `help` to see available commands.
  
